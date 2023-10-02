@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import plotly.express as px
-from scipy.signal import savgol_filter
+from rasterio import windows
+from s2cloudless import S2PixelCloudDetector
 from datetime import datetime
 from satsearch import Search
 from shapely.geometry import shape, mapping
@@ -71,28 +72,69 @@ from joblib import Parallel, delayed
     Sentinel Hub. (n.d.). Sentinel-2 L2A scene classification map. Retrieved from https://custom-scripts.sentinel-hub.com/custom-scripts/sentinel-2/scene-classification/
     European Space Agency. (n.d.). Sentinel-2 User Handbook. Retrieved from https://sentinels.copernicus.eu/documents/247904/685211/Sentinel-2_User_Handbook
 """
-CLOUD_CLASSES = [3, 8, 9, 10]
-BANDS = ['nir08', 'red', 'scl']
+# CLOUD_CLASSES = [3, 8, 9, 10]
+# _BANDS = ['B01', 'B02', 'B04', 'B05', 'B08', 'B8A', 'B09', 'B10', 'B11', 'B12']
+# S2_BANDS = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B10", "B11", "B12"]
+# MODEL_BAND_IDS = [0, 1, 3, 4, 7, 8, 9, 10, 11, 12]
+
+BANDS = ['coastal', 'blue', 'red', 'rededge1', 'nir', 'nir08', 'nir09', 'cirrus', 'swir16', 'swir22']
+WINDOW_SIZE = 50
 NODATA = None
 
+cloud_detector = S2PixelCloudDetector(threshold=0.4, average_over=4, dilation_size=2)
 class Constants:
     STAC_API_URL = 'https://earth-search.aws.element84.com/v1'
-    COLLECTION = 'sentinel-2-l2a'
+    COLLECTION = 'sentinel-2-l1c'
     CLOUD_COVER_LIMIT = 5
 
 @logger.catch
-def s2cloudless(pixel_data):
-    """ Mask the NIR and RED bands based on the SCL band (s2cloudless). """
-    # Check if the pixel in the 'scl' band belongs to any cloud class
-    is_cloud = pixel_data['scl'] in CLOUD_CLASSES
+def s2cloudless(pixel_data, col, row):
+    image_array = np.array([
+        pixel_data['coastal_window'],
+        pixel_data['blue_window'],
+        pixel_data['red_window'],
+        pixel_data['B05_window'],
+        pixel_data['nir_window'],
+        pixel_data['B8A_window'],
+        pixel_data['B09_window'],
+        pixel_data['cirrus_window'],
+        pixel_data['swir16_window'],
+        pixel_data['swir22_window']
+    ])
+
+    # Get cloud probability masks and binary cloud masks
+    cloud_probs = cloud_detector.get_cloud_probability_maps(image_array)
+    cloud_masks = cloud_detector.get_cloud_masks(cloud_probs)
+
+    is_cloud = cloud_masks[row, col]
 
     if is_cloud:
-        pixel_data['nir08'] = NODATA
+        pixel_data['nir'] = NODATA
         pixel_data['red'] = NODATA
 
     return pixel_data
 
 @logger.catch
+# def get_pixel_value(urls, lon, lat, datetime):
+#     band_values = {}
+#     band_values['datetime'] = datetime
+#
+#     for band_name, url in zip(BANDS, urls):
+#         try:
+#             with COGReader(url) as cog:
+#                 point_data = cog.point(lon, lat)
+#                 value = point_data.array.data[0] if point_data.array is not None else None
+#                 band_values[band_name] = value
+#         except Exception as e:
+#             logger.error(f"Failed to get pixel value for band {band_name} in dataset {url}. Error: {e}")
+#             band_values[band_name] = None
+#
+#     # Apply the s2cloudless mask
+#     band_values = s2cloudless(band_values)
+#
+#     return band_values
+
+
 def get_pixel_value(urls, lon, lat, datetime):
     band_values = {}
     band_values['datetime'] = datetime
@@ -100,6 +142,15 @@ def get_pixel_value(urls, lon, lat, datetime):
     for band_name, url in zip(BANDS, urls):
         try:
             with COGReader(url) as cog:
+                # Get the row, col for the specific lon, lat
+                col, row = cog.index(lon, lat)
+                # Define a window around that pixel
+                window = windows.Window(col - WINDOW_SIZE // 2, row - WINDOW_SIZE // 2, WINDOW_SIZE, WINDOW_SIZE)
+                window_data = cog.read(window=window)
+
+                # Store the entire window data (for s2cloudless later on)
+                band_values[f"{band_name}_window"] = window_data
+
                 point_data = cog.point(lon, lat)
                 value = point_data.array.data[0] if point_data.array is not None else None
                 band_values[band_name] = value
@@ -108,10 +159,9 @@ def get_pixel_value(urls, lon, lat, datetime):
             band_values[band_name] = None
 
     # Apply the s2cloudless mask
-    band_values = s2cloudless(band_values)
+    band_values = s2cloudless(band_values, col, row)
 
     return band_values
-
 
 @logger.catch
 def process_period(id, start_year, end_year, geometry):
@@ -134,9 +184,7 @@ def process_period(id, start_year, end_year, geometry):
 
     # tasks = []
     if items:
-        for item in items:
-            logger.info(f"{item.assets['scl']}")
-
+        logger.info(f"{items[0].assets}")
         results = Parallel(n_jobs=-1)(delayed(get_pixel_value)([f"{item.assets[b]['href']}" for b in BANDS], geometry.x, geometry.y, item.datetime) for item in items)
         if results:
             # Convert list of dictionaries to list of tuples
