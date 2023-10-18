@@ -25,7 +25,6 @@ from joblib import Parallel, delayed
     9: Cloud high probability
     10: Thin cirrus
     11: Snow
-    
     function evaluatePixel(samples) {
         const SCL=samples.SCL;
         switch (SCL) {
